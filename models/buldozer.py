@@ -22,10 +22,12 @@ class Buldozer(object):
                  c_sub_obj_cs=[1e-3, 1e-3],
                  mul=True,
                  optimizer=lasagne.updates.adamax,
-                 l2_c=0
+                 l2_c=0,
+                 c_obj=1
                 ):
         self.img_shape = img_shape
         self.l2_c = l2_c
+        self.c_obj = c_obj
 
         self.c_sub_objs = c_sub_objs
         self.c_sub_obj_cs = c_sub_obj_cs
@@ -154,7 +156,7 @@ class Buldozer(object):
         for layer in lasagne.layers.get_all_layers(self.output_layer):
             l2_penalty += regularize_layer_params(layer, l2)
 
-        return self.get_loss() +\
+        return self.c_obj * self.get_loss() +\
                self.get_sub_loss() +\
                self.c_complexity * self.get_total_complexity() +\
                self.l2_c * l2_penalty
