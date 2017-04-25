@@ -16,23 +16,18 @@ class Buldozer(object):
                  cascades_params,
                  img_shape=(640, 480),
                  learning_rate=1e-3,
-                 c=1.0,
                  c_complexity=1e-1,
                  c_sub_objs=[1e-3, 1e-3],
                  c_sub_obj_cs=[1e-3, 1e-3],
-                 mul=True,
                  optimizer=lasagne.updates.adamax,
-                 l2_c=0,
-                 c_obj=1
+                 l2_c=0
                 ):
         self.img_shape = img_shape
         self.l2_c = l2_c
-        self.c_obj = c_obj
 
         self.c_sub_objs = c_sub_objs
         self.c_sub_obj_cs = c_sub_obj_cs
         self.c_complexity = c_complexity
-        self.c = c
 
         self.input_X = T.tensor4('inputs')
         self.targets = T.tensor4('targets')
@@ -40,20 +35,18 @@ class Buldozer(object):
         assert(len(c_sub_objs) == len(c_sub_obj_cs) == len(cascades_params) == len(cascades_builders))
         self.num_cascades = len(cascades_params)
 
-        (self.out,
-         self.downsampled_activation_layers,
-         self.masked_output_layer,
+        (self.downsampled_activation_layers,
          self.complexities) = self.build_network(cascades_builders, cascades_params)
 
-        if mul:
-            self.output_layer = self.masked_output_layer
-        else:
-            self.output_layer = self.out
+
+        self.output_layer = self.downsampled_activation_layers[-1]
 
         assert(len(self.downsampled_activation_layers) == len(self.c_sub_obj_cs) == len(self.c_sub_objs))
 
         self.output = self.build_output()
         self.target_pool_layers = self.build_target_pool_layers()
+        
+        assert(len(self.target_pool_layers) == len(self.downsampled_activation_layers))
 
         self.train = self.compile_trainer(learning_rate, optimizer)
         self.evaluate = self.compile_evaluator()
@@ -78,17 +71,9 @@ class Buldozer(object):
                                            self.img_shape)
             result.append(MaxPool2DLayer(input_layer, pool_size=pool_size))
 
-        result.append(
-                      MaxPool2DLayer(
-                                     input_layer,
-                                     pool_size=self.get_pool_size(lasagne.layers.get_output_shape(self.output_layer),
-                                                                  self.img_shape)
-                                    )
-                     )
-
         return result
 
-    def get_sub_loss(self):
+    def get_companion_loss(self):
         sub_obj = 0
 
         for i, activation_layer in enumerate(self.downsampled_activation_layers):
@@ -106,13 +91,11 @@ class Buldozer(object):
         max_complexity = []
         constants = []
 
-        for i in range(len(self.downsampled_activation_layers) - 1):
+        for i in range(len(self.downsampled_activation_layers)):
             activation_layer = self.downsampled_activation_layers[i]
             targets = lasagne.layers.get_output(self.target_pool_layers[i], self.targets)
 
-            pool_size = self.get_pool_size(lasagne.layers.get_output_shape(self.downsampled_activation_layers[i + 1]),
-                                           self.img_shape)
-            constants.append(np.prod(pool_size))
+            constants.append(np.prod(lasagne.layers.get_output_shape(activation_layer)[1:]))
             complexity.append((lasagne.layers.get_output(activation_layer) * (1 - targets)).sum())
             max_complexity.append((1 - targets).sum())
 
@@ -144,20 +127,13 @@ class Buldozer(object):
 
         return result
 
-    def get_loss(self):
-        a = self.output.ravel()
-        t = lasagne.layers.get_output(self.target_pool_layers[-1], self.targets).ravel()
-
-        return self.compute_loss(a, t, self.c)
-
     def get_obj(self):
         l2_penalty = 0
 
         for layer in lasagne.layers.get_all_layers(self.output_layer):
             l2_penalty += regularize_layer_params(layer, l2)
 
-        return self.c_obj * self.get_loss() +\
-               self.get_sub_loss() +\
+        return self.get_companion_loss() +\
                self.c_complexity * self.get_total_complexity() +\
                self.l2_c * l2_penalty
 
@@ -189,17 +165,9 @@ class Buldozer(object):
 
         # Build network
         for i in range(self.num_cascades):
-            net, complexity = cascades_builders[i](net, *cascades_params[i])
+            net, complexity = cascades_builders[i](net, *(list(cascades_params[i]) + [str(i)]))
             cascade_outs.append(net)
             complexities.append(complexity)
-
-
-        out = Conv2DLayer(net,
-                          nonlinearity=sigmoid,
-                          num_filters=1,
-                          filter_size=1,
-                          pad='same',
-                          name='prediction layer')
 
         # NOTE: Early stop classifiers and multiply step
         branches = [None] * self.num_cascades
@@ -210,6 +178,7 @@ class Buldozer(object):
                                       num_filters=1,
                                       filter_size=1,
                                       nonlinearity=sigmoid,
+                                      pad='same',
                                       name='decide network {} output'.format(i + 1))
 
         downsampled_activation_layers = [branches[0]]
@@ -222,16 +191,11 @@ class Buldozer(object):
                                                    self.get_pool_size(
                                                        lasagne.layers.get_output_shape(branches[i + 1]),
                                                        lasagne.layers.get_output_shape(downsampled_activation_layers[-1])
-                                                                      )
-                                                                     )
+                                                   )
                                                 )
-        masked_out = MaxPoolMultiplyLayer(
-                        out,
-                        downsampled_activation_layers[-1],
-                        self.get_pool_size(lasagne.layers.get_output_shape(out),
-                                           lasagne.layers.get_output_shape(downsampled_activation_layers[-1])))
+            )
 
-        return out, downsampled_activation_layers, masked_out, complexities
+        return downsampled_activation_layers, complexities
 
     def compile_forward_pass(self):
         return theano.function([self.input_X], self.output)
@@ -242,8 +206,7 @@ class Buldozer(object):
                                                               'recall' : self.get_recall(),
                                                               'precision' : self.get_precision(),
                                                               'accuracy' : self.get_accuracy(),
-                                                              'loss' : self.get_loss(),
-                                                              'sub_loss' : self.get_sub_loss(),
+                                                              'companion_loss' : self.get_companion_loss(),
                                                               'total_complexity' : self.get_total_complexity(),
                                                               'complexity_parts' : T.stack(self.get_complexity_parts())
                                                              })
@@ -263,17 +226,16 @@ class Buldozer(object):
                                 'recall' : self.get_recall(),
                                 'precision' : self.get_precision(),
                                 'accuracy' : self.get_accuracy(),
-                                'loss' : self.get_loss(),
-                                'sub_loss' : self.get_sub_loss(),
+                                'companion_loss' : self.get_companion_loss(),
                                 'total_complexity' : self.get_total_complexity(),
                                 'complexity_parts' : T.stack(self.get_complexity_parts())
                                },
                                updates=updates)
 
     def save(self, path, name):
-        np.savez(os.path.join(path, name), *lasagne.layers.get_all_param_values(self.masked_output_layer))
+        np.savez(os.path.join(path, name), *lasagne.layers.get_all_param_values(self.output_layer))
 
     def load(self, path, name):
         with np.load(os.path.join(path, name + '.npz')) as f:
             param_values = [f['arr_%d' % i] for i in range(len(f.files))]
-            lasagne.layers.set_all_param_values(self.masked_output_layer, param_values)
+            lasagne.layers.set_all_param_values(self.output_layer, param_values)
