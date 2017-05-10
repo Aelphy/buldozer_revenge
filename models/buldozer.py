@@ -22,10 +22,12 @@ class Buldozer(object):
                  c_sub_obj_cs=[1e-3, 1e-3],
                  mul=True,
                  optimizer=lasagne.updates.adamax,
-                 l2_c=0
+                 l2_c=0,
+                 c_obj=1
                 ):
         self.img_shape = img_shape
         self.l2_c = l2_c
+        self.c_obj = c_obj
 
         self.c_sub_objs = c_sub_objs
         self.c_sub_obj_cs = c_sub_obj_cs
@@ -108,9 +110,15 @@ class Buldozer(object):
             activation_layer = self.downsampled_activation_layers[i]
             targets = lasagne.layers.get_output(self.target_pool_layers[i], self.targets)
 
-            pool_size = self.get_pool_size(lasagne.layers.get_output_shape(self.downsampled_activation_layers[i + 1]),
-                                           self.img_shape)
-            constants.append(np.prod(pool_size))
+            constants.append(np.prod(lasagne.layers.get_output_shape(activation_layer)[1:]))
+            complexity.append((lasagne.layers.get_output(activation_layer) * (1 - targets)).sum())
+            max_complexity.append((1 - targets).sum())
+            
+        if (len(self.downsampled_activation_layers) == 1):
+            activation_layer = self.downsampled_activation_layers[0]
+            targets = lasagne.layers.get_output(self.target_pool_layers[0], self.targets)
+
+            constants.append(np.prod(lasagne.layers.get_output_shape(activation_layer)[1:]))
             complexity.append((lasagne.layers.get_output(activation_layer) * (1 - targets)).sum())
             max_complexity.append((1 - targets).sum())
 
@@ -154,7 +162,7 @@ class Buldozer(object):
         for layer in lasagne.layers.get_all_layers(self.output_layer):
             l2_penalty += regularize_layer_params(layer, l2)
 
-        return self.get_loss() +\
+        return self.c_obj * self.get_loss() +\
                self.get_sub_loss() +\
                self.c_complexity * self.get_total_complexity() +\
                self.l2_c * l2_penalty
@@ -187,7 +195,7 @@ class Buldozer(object):
 
         # Build network
         for i in range(self.num_cascades):
-            net, complexity = cascades_builders[i](net, *cascades_params[i])
+            net, complexity = cascades_builders[i](net, *(list(cascades_params[i]) + [str(i)]))
             cascade_outs.append(net)
             complexities.append(complexity)
 
@@ -208,6 +216,7 @@ class Buldozer(object):
                                       num_filters=1,
                                       filter_size=1,
                                       nonlinearity=sigmoid,
+                                      pad='same',
                                       name='decide network {} output'.format(i + 1))
 
         downsampled_activation_layers = [branches[0]]
@@ -220,9 +229,9 @@ class Buldozer(object):
                                                    self.get_pool_size(
                                                        lasagne.layers.get_output_shape(branches[i + 1]),
                                                        lasagne.layers.get_output_shape(downsampled_activation_layers[-1])
-                                                                      )
-                                                                     )
+                                                   )
                                                 )
+            )
         masked_out = MaxPoolMultiplyLayer(
                         out,
                         downsampled_activation_layers[-1],
