@@ -10,6 +10,7 @@ from lasagne.layers import Conv2DLayer,\
                            Upscale2DLayer,\
                            ConcatLayer,\
                            batch_norm
+from lasagne.layers import get_output, get_all_params, set_all_param_values
 from lasagne.nonlinearities import elu, softmax
 from lasagne.regularization import l2, regularize_layer_params
 from lasagne.init import GlorotUniform
@@ -39,7 +40,8 @@ class TreeNet(object):
         self.predict = self.compile_forward_pass()
         
     def apply_4d_shape(self, output):
-        eval_params = {self.input_X : np.zeros([1, 1] + list(self.img_shape), dtype=np.float32)}
+        eval_params = {self.input_X : np.zeros([1, 1] + list(self.img_shape),
+                                               dtype=np.float32)}
         shape = list(output.shape.eval(eval_params))
         
         if len(shape) < 4:
@@ -48,7 +50,8 @@ class TreeNet(object):
         return output
         
     def upscale(self, small_output, big_output):
-        eval_params = {self.input_X : np.zeros([1, 1] + list(self.img_shape), dtype=np.float32)}
+        eval_params = {self.input_X : np.zeros([1, 1] + list(self.img_shape),
+                                               dtype=np.float32)}
         secure_small_output = self.apply_4d_shape(small_output)
         small_shape = secure_small_output.shape.eval(eval_params)[1:]
         big_shape = big_output.shape.eval(eval_params)[1:]
@@ -62,11 +65,11 @@ class TreeNet(object):
         return self.upscale(small_output, big_output) + self.apply_4d_shape(big_output)
         
     def upscale_and_mul(self, small_output, big_output):   
-        return self.upscale(small_output, big_output) + self.apply_4d_shape(big_output)
+        return self.upscale(small_output, big_output) * self.apply_4d_shape(big_output)
 
     def build_output(self):
-        result_classes = self.upscale_and_mul(lasagne.layers.get_output(self.net['classifier_0']),
-                                              lasagne.layers.get_output(self.net['o0'])[:, 0, :, :])
+        result_classes = self.upscale_and_mul(get_output(self.net['classifier_0']),
+                                              get_output(self.net['o0'])[:, 0, :, :])
         result_nothing = lasagne.layers.get_output(self.net['o0'])[:, 1, :, :]
                 
         for i in range(1, self.num_cascades):
@@ -77,18 +80,18 @@ class TreeNet(object):
             p_continue = decision[:, 2, :, :]
             
             for j in range(i - 1):
-                new_p_continue = lasagne.layers.get_output(self.net['o{}'.format(j)])[:, 2, :, :]
+                new_p_continue = get_output(self.net['o{}'.format(j)])[:, 2, :, :]
                 p_continue = self.upscale_and_mul(new_p_continue, p_continue)
                     
             p_local_stop = self.upscale_and_mul(p_continue,
-                                                lasagne.layers.get_output(self.net['o{}'.format(i)])[:, 1, :, :])
+                                                get_output(self.net['o{}'.format(i)])[:, 1, :, :])
             p_stop = self.upscale_and_add(
                 p_stop,
                 p_local_stop
             )
             
-            p_class = self.upscale_and_mul(lasagne.layers.get_output(self.net['classifier_{}'.format(i)]),
-                                           lasagne.layers.get_output(self.net['o{}'.format(i)])[:, 0, :, :])
+            p_class = self.upscale_and_mul(get_output(self.net['classifier_{}'.format(i)]),
+                                           get_output(self.net['o{}'.format(i)])[:, 0, :, :])
             
             p_local_class = self.upscale_and_mul(p_continue, p_class)
             result_classes = self.upscale_and_add(result_classes,
@@ -96,7 +99,9 @@ class TreeNet(object):
             result_nothing = self.upscale_and_add(result_nothing,
                                                   p_stop)
 
-        return T.join(1, result_classes, result_nothing)
+        preready_result = T.join(1, result_classes, result_nothing)
+        input_l = InputLayer([None, 11, 64, 64], preready_result)
+        return get_output(SpatialSoftmax(input_l))
 
     def get_pool_size(self, smaller_dim, higher_dim):
         return np.array(higher_dim)[-2:] / np.array(smaller_dim)[-2:]
@@ -175,29 +180,37 @@ class TreeNet(object):
 
     def compile_forward_pass(self):
         return theano.function([self.input_X], self.output)
+    
+    def get_accuracy(self):
+        return (T.isclose(T.argmax(self.targets, axis=1), T.argmax(self.output, axis=1))).mean()
                                                   
     def get_obj(self):
-        return lasagne.objectives.categorical_crossentropy(self.output.ravel(), self.targets.ravel()).mean()
+        return -((self.targets * T.log(self.output)).sum(axis=1)).mean()
 
     def compile_evaluator(self):
-        return theano.function([self.input_X, self.targets], self.get_obj())
+        return theano.function([self.input_X, self.targets], {'obj' : self.get_obj(),
+                                                              'accuracy' : self.get_accuracy()})
 
     def compile_trainer(self, learning_rate, optimizer):
         obj = self.get_obj()
 
-        params = lasagne.layers.get_all_params(self.net['classifier_{}'.format(self.num_cascades - 1)], trainable=True)
+        params = get_all_params(self.net['classifier_{}'.format(self.num_cascades - 1)],
+                                trainable=True)
 
         updates = optimizer(obj,
                             params,
                             learning_rate=learning_rate)
 
-        return theano.function([self.input_X, self.targets], obj, updates=updates)
+        return theano.function([self.input_X, self.targets],
+                               {'obj' : obj, 'accuracy' : self.get_accuracy()},
+                               updates=updates)
 
     def save(self, path, name):
         np.savez(os.path.join(path, name),
-                 *lasagne.layers.get_all_param_values(self.net['classifier_{}'.format(self.num_cascades - 1)]))
+                 *get_all_param_values(self.net['classifier_{}'.format(self.num_cascades - 1)]))
 
     def load(self, path, name):
         with np.load(os.path.join(path, name + '.npz')) as f:
             param_values = [f['arr_%d' % i] for i in range(len(f.files))]
-            lasagne.layers.set_all_param_values(self.net['classifier_{}'.format(self.num_cascades - 1)], param_values)
+            set_all_param_values(self.net['classifier_{}'.format(self.num_cascades - 1)],
+                                 param_values)
