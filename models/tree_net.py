@@ -82,26 +82,19 @@ class TreeNet(object):
             for j in range(i - 1):
                 new_p_continue = get_output(self.net['o{}'.format(j)])[:, 2, :, :]
                 p_continue = self.upscale_and_mul(new_p_continue, p_continue)
-                    
-            p_local_stop = self.upscale_and_mul(p_continue,
-                                                get_output(self.net['o{}'.format(i)])[:, 1, :, :])
-            p_stop = self.upscale_and_add(
-                p_stop,
-                p_local_stop
-            )
-            
+                                
             p_class = self.upscale_and_mul(get_output(self.net['classifier_{}'.format(i)]),
-                                           get_output(self.net['o{}'.format(i)])[:, 0, :, :])
+                                           p_classify)
             
             p_local_class = self.upscale_and_mul(p_continue, p_class)
+            p_local_stop = self.upscale_and_mul(p_continue, p_stop)
+            
             result_classes = self.upscale_and_add(result_classes,
                                                   p_local_class)
             result_nothing = self.upscale_and_add(result_nothing,
-                                                  p_stop)
+                                                  p_local_stop)
 
-        preready_result = T.join(1, result_classes, result_nothing)
-        input_l = InputLayer([None, 11, 64, 64], preready_result)
-        return get_output(SpatialSoftmax(input_l))
+        return T.join(1, result_classes, result_nothing)
 
     def get_pool_size(self, smaller_dim, higher_dim):
         return np.array(higher_dim)[-2:] / np.array(smaller_dim)[-2:]
